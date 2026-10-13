@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 import os
 import json 
 import re
@@ -13,9 +13,8 @@ from flask_cors import CORS
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# --- FIREBASE STORAGE IMPORT ---
-import firebase_admin
-from firebase_admin import credentials, storage
+# --- SUPABASE STORAGE IMPORT ---
+from supabase import create_client
 
 # --- ML & OCR IMPORTS ---
 import PyPDF2
@@ -30,90 +29,81 @@ app = Flask(__name__)
 CORS(app) 
 load_dotenv()
 
-# --- CONFIGURATION ---
-UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
+# --- DATABASE CONFIGURATION ---
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///app.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# --- FORCE SSL FOR TiDB SERVERLESS ---
-app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-    'connect_args': {
-        'ssl': {
-            'ssl_verify_cert': True,
-            'ssl_verify_identity': True
-        }
-    }
-}
+# --- SUPABASE STORAGE CONFIGURATION ---
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
+SUPABASE_BUCKET = os.environ.get('SUPABASE_BUCKET', 'tender-docs')
 
-# --- FIREBASE STORAGE CONFIGURATION ---
-FIREBASE_CRED_PATH = os.environ.get('FIREBASE_CRED_PATH', 'serviceAccountKey.json')
-FIREBASE_CRED_JSON = os.environ.get('FIREBASE_CRED_JSON')
-FIREBASE_STORAGE_BUCKET = os.environ.get('FIREBASE_STORAGE_BUCKET') # e.g. 'your-project-id.firebasestorage.app'
-
-if FIREBASE_CRED_JSON:
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
     try:
-        cred_dict = json.loads(FIREBASE_CRED_JSON)
-        cred = credentials.Certificate(cred_dict)
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ Supabase Client initialized successfully.")
     except Exception as e:
-        print(f"⚠️ Failed to parse FIREBASE_CRED_JSON: {e}")
-        cred = None
-elif os.path.exists(FIREBASE_CRED_PATH):
-    cred = credentials.Certificate(FIREBASE_CRED_PATH)
+        print(f"⚠️ Supabase initialization error: {e}")
 else:
-    cred = None
-    print("⚠️ FIREBASE NOTICE: No serviceAccountKey.json found locally or FIREBASE_CRED_JSON in env.")
-
-if cred:
-    try:
-        firebase_admin.initialize_app(cred, {
-            'storageBucket': FIREBASE_STORAGE_BUCKET
-        })
-        print("✅ Firebase Admin SDK initialized successfully.")
-    except Exception as e:
-        print(f"⚠️ Firebase initialization error: {e}")
+    print("⚠️ SUPABASE NOTICE: Missing SUPABASE_URL or SUPABASE_KEY in environment variables.")
 
 db = SQLAlchemy(app)
 
 
-def upload_to_firebase(file_obj, folder="tender_app"):
-    """Helper function to upload files to Firebase Storage and return HTTPS public URL."""
+# ==========================================
+# HEALTH CHECK ENDPOINT (For Cron-job.org)
+# ==========================================
+@app.route('/', methods=['GET'])
+def health_check():
+    """Lightweight endpoint to keep Render awake and verify server status."""
+    return jsonify({
+        "status": "active",
+        "service": "Tender App Backend",
+        "database": "Supabase PostgreSQL",
+        "storage": "Supabase Storage",
+        "timestamp": datetime.utcnow().isoformat()
+    }), 200
+
+
+def upload_to_supabase(file_obj, folder="tender_app"):
+    """Helper function to upload files to Supabase Storage and return HTTPS public URL."""
     if not file_obj or file_obj.filename == '':
         return None
+    if not supabase:
+        print("❌ Supabase client not initialized.")
+        return None
+        
     try:
         filename = secure_filename(file_obj.filename)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_filename = f"{timestamp}_{filename}"
-        blob_path = f"{folder}/{unique_filename}"
-        
-        bucket = storage.bucket()
-        blob = bucket.blob(blob_path)
+        unique_filename = f"{folder}/{timestamp}_{filename}"
         
         content_type = getattr(file_obj, 'content_type', None) or 'application/octet-stream'
         
         if hasattr(file_obj, 'seek'):
             file_obj.seek(0)
             
-        blob.upload_from_file(file_obj, content_type=content_type)
+        file_bytes = file_obj.read()
         
-        # Make the file publicly accessible (prevents 401 ACL/permission errors)
-        blob.make_public()
+        supabase.storage.from_(SUPABASE_BUCKET).upload(
+            path=unique_filename,
+            file=file_bytes,
+            file_options={"content-type": content_type, "upsert": "true"}
+        )
         
-        return blob.public_url
+        public_url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(unique_filename)
+        return public_url
     except Exception as e:
-        print(f"❌ Firebase Upload Error: {str(e)}")
+        print(f"❌ Supabase Upload Error: {str(e)}")
         return None
 
 
 def get_file_url(path):
-    """Helper function to format local paths vs Firebase HTTPS URLs."""
+    """Helper function to format remote Supabase HTTPS URLs."""
     if not path:
         return None
-    if path.startswith("http://") or path.startswith("https://"):
-        return path
-    return f"/uploads/{path}"
+    return path
 
 
 def normalize_email(value):
@@ -265,12 +255,11 @@ def train_optimal_bid_predictor():
 ml_awarding_model = train_awarding_model()
 ml_bid_predictor = train_optimal_bid_predictor()
 
-def extract_text_from_pdf(pdf_path_or_url):
+def extract_text_from_pdf(pdf_url):
     try:
         text = ""
-        # Handle Remote Firebase/HTTPS URLs
-        if pdf_path_or_url.startswith("http://") or pdf_path_or_url.startswith("https://"):
-            response = requests.get(pdf_path_or_url)
+        if pdf_url and (pdf_url.startswith("http://") or pdf_url.startswith("https://")):
+            response = requests.get(pdf_url)
             file_bytes = io.BytesIO(response.content)
             reader = PyPDF2.PdfReader(file_bytes)
             for page in reader.pages:
@@ -286,37 +275,16 @@ def extract_text_from_pdf(pdf_path_or_url):
                     images = convert_from_path(temp_pdf.name)
                     for image in images:
                         text += pytesseract.image_to_string(image) + " "
-        else:
-            # Handle Local Disk Fallback
-            with open(pdf_path_or_url, 'rb') as file:
-                reader = PyPDF2.PdfReader(file)
-                for page in reader.pages:
-                    extracted = page.extract_text()
-                    if extracted: 
-                        text += extracted + " "
-            
-            if len(text.strip()) < 50:
-                print(f"🔍 Scanned local document detected. Activating Tesseract OCR for {os.path.basename(pdf_path_or_url)}...")
-                images = convert_from_path(pdf_path_or_url)
-                for image in images:
-                    text += pytesseract.image_to_string(image) + " "
         return text.lower()
     except Exception as e:
-        print(f"⚠️ OCR Error on {pdf_path_or_url}: {str(e)}")
+        print(f"⚠️ OCR Error on {pdf_url}: {str(e)}")
         return ""
 
 def compare_documents(bidder_filepath, authority_tender_text):
-    if not bidder_filepath: 
+    if not bidder_filepath or not (bidder_filepath.startswith("http://") or bidder_filepath.startswith("https://")): 
         return 0.0
     
-    if bidder_filepath.startswith("http://") or bidder_filepath.startswith("https://"):
-        full_path = bidder_filepath
-    else:
-        full_path = os.path.join(app.config['UPLOAD_FOLDER'], bidder_filepath)
-        if not os.path.exists(full_path): 
-            return 0.0
-    
-    bidder_doc_text = extract_text_from_pdf(full_path)
+    bidder_doc_text = extract_text_from_pdf(bidder_filepath)
     if len(bidder_doc_text) < 50: 
         return 0.0 
 
@@ -351,8 +319,9 @@ def execute_master_ml_evaluation(tender, bids):
         try:
             admin_docs = json.loads(tender.tender_docs)
             for doc in admin_docs:
-                doc_path = doc if (doc.startswith("http://") or doc.startswith("https://")) else os.path.join(app.config['UPLOAD_FOLDER'], doc)
-                authority_text += " " + extract_text_from_pdf(doc_path)
+                url = doc.get("fileUrl") if isinstance(doc, dict) else doc
+                if url and (url.startswith("http://") or url.startswith("https://")):
+                    authority_text += " " + extract_text_from_pdf(url)
         except Exception:
             pass
 
@@ -402,14 +371,6 @@ def execute_master_ml_evaluation(tender, bids):
 
 
 # ==========================================
-# FILE SERVING ENDPOINT
-# ==========================================
-@app.route('/uploads/<path:filename>', methods=['GET'])
-def serve_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
-
-# ==========================================
 # 3. BIDDER ENDPOINTS
 # ==========================================
 
@@ -433,9 +394,9 @@ def register():
         if not all([gst, inc, pan]):
             return jsonify({"success": False, "message": "Missing mandatory documents"}), 400
 
-        gst_url = upload_to_firebase(gst, folder="user_docs")
-        inc_url = upload_to_firebase(inc, folder="user_docs")
-        pan_url = upload_to_firebase(pan, folder="user_docs")
+        gst_url = upload_to_supabase(gst, folder="user_docs")
+        inc_url = upload_to_supabase(inc, folder="user_docs")
+        pan_url = upload_to_supabase(pan, folder="user_docs")
 
         new_user = User(
             full_name=data.get('full_name'), email=email,
@@ -529,7 +490,7 @@ def update_profile():
         if 'profile_image' in request.files:
             file = request.files['profile_image']
             if file.filename != '':
-                pic_url = upload_to_firebase(file, folder="profiles")
+                pic_url = upload_to_supabase(file, folder="profiles")
                 if pic_url:
                     user.profile_pic_path = pic_url
 
@@ -609,7 +570,7 @@ def update_compliance_docs():
         if file_key in request.files:
             file_obj = request.files[file_key]
             if file_obj and file_obj.filename != '':
-                doc_url = upload_to_firebase(file_obj, folder="compliance_docs")
+                doc_url = upload_to_supabase(file_obj, folder="compliance_docs")
                 if doc_url:
                     setattr(user, attr_name, doc_url)
 
@@ -647,14 +608,14 @@ def update_gst_pan():
         if 'new_gst_certificate' in request.files:
             gst_file = request.files['new_gst_certificate']
             if gst_file.filename != '':
-                gst_url = upload_to_firebase(gst_file, folder="user_docs")
+                gst_url = upload_to_supabase(gst_file, folder="user_docs")
                 if gst_url:
                     user.gst_cert_path = gst_url
 
         if 'new_pan_card' in request.files:
             pan_file = request.files['new_pan_card']
             if pan_file.filename != '':
-                pan_url = upload_to_firebase(pan_file, folder="user_docs")
+                pan_url = upload_to_supabase(pan_file, folder="user_docs")
                 if pan_url:
                     user.pan_card_path = pan_url
 
@@ -688,7 +649,7 @@ def submit_bid():
         for key in file_keys:
             f = request.files.get(key)
             if f and f.filename != '':
-                doc_url = upload_to_firebase(f, folder="bids")
+                doc_url = upload_to_supabase(f, folder="bids")
                 if doc_url:
                     paths[key] = doc_url
 
@@ -720,6 +681,34 @@ def submit_bid():
             db.session.commit()
             return jsonify({"success": True, "message": "Bid submitted successfully!", "referenceId": f"NEW-BID-{new_bid.id}"}), 201
 
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/api/withdraw_bid', methods=['POST', 'DELETE'])
+@app.route('/api/delete_bid', methods=['POST', 'DELETE'])
+def withdraw_bid():
+    try:
+        data = request.get_json(silent=True) or request.form or request.args
+        tender_id = data.get('tender_id') or data.get('tenderId')
+        user_id = data.get('user_id') or data.get('userId')
+        bid_id = data.get('bid_id') or data.get('bidId')
+
+        bid = None
+        if bid_id:
+            bid = db.session.get(Bid, int(bid_id))
+        elif tender_id and user_id:
+            bid = Bid.query.filter_by(tender_id=int(tender_id), bidder_id=int(user_id)).first()
+
+        if not bid:
+            return jsonify({"success": False, "message": "Active bid not found."}), 404
+
+        if bid.status not in ['Pending Review']:
+            return jsonify({"success": False, "message": "Cannot withdraw a bid currently under evaluation."}), 400
+
+        db.session.delete(bid)
+        db.session.commit()
+        return jsonify({"success": True, "message": "Bid withdrawn successfully!"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "message": str(e)}), 500
@@ -811,10 +800,10 @@ def admin_register():
         if not all([auth_letter, id_proof, dsc_key, dept_reg]):
             return jsonify({"success": False, "message": "Missing mandatory documents"}), 400
 
-        al_url = upload_to_firebase(auth_letter, folder="authority_docs")
-        id_url = upload_to_firebase(id_proof, folder="authority_docs")
-        dsc_url = upload_to_firebase(dsc_key, folder="authority_docs")
-        dept_url = upload_to_firebase(dept_reg, folder="authority_docs")
+        al_url = upload_to_supabase(auth_letter, folder="authority_docs")
+        id_url = upload_to_supabase(id_proof, folder="authority_docs")
+        dsc_url = upload_to_supabase(dsc_key, folder="authority_docs")
+        dept_url = upload_to_supabase(dept_reg, folder="authority_docs")
 
         new_auth = Authority(
             admin_name=data.get('adminName') or "Unknown", designation=data.get('designation') or "Unknown",
@@ -892,7 +881,7 @@ def update_authority_profile():
         if 'profile_image' in request.files:
             file = request.files['profile_image']
             if file.filename != '':
-                pic_url = upload_to_firebase(file, folder="profiles")
+                pic_url = upload_to_supabase(file, folder="profiles")
                 if pic_url:
                     admin.profile_pic_path = pic_url
 
@@ -972,7 +961,7 @@ def update_admin_docs():
         if file_key in request.files:
             file_obj = request.files[file_key]
             if file_obj and file_obj.filename != '':
-                doc_url = upload_to_firebase(file_obj, folder="authority_docs")
+                doc_url = upload_to_supabase(file_obj, folder="authority_docs")
                 if doc_url:
                     setattr(admin, attr_name, doc_url)
 
@@ -990,14 +979,43 @@ def update_admin_docs():
 def create_tender():
     try:
         data = request.form
-        uploaded_paths = []
+        uploaded_docs = []
         for file_key in request.files:
             for doc in request.files.getlist(file_key):
                 if doc.filename != '':
-                    doc_url = upload_to_firebase(doc, folder="tenders")
+                    filename = doc.filename
+                    extracted_text = ""
+                    try:
+                        file_bytes = doc.read()
+                        doc.seek(0)
+                        file_like = io.BytesIO(file_bytes)
+                        reader = PyPDF2.PdfReader(file_like)
+                        for page_num, page in enumerate(reader.pages):
+                            page_text = page.extract_text()
+                            if page_text:
+                                extracted_text += f"\n--- Page {page_num + 1} ---\n" + page_text
+
+                        if len(extracted_text.strip()) < 50:
+                            doc.seek(0)
+                            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as temp_pdf:
+                                temp_pdf.write(doc.read())
+                                temp_pdf.flush()
+                                images = convert_from_path(temp_pdf.name)
+                                for image in images:
+                                    extracted_text += pytesseract.image_to_string(image) + " "
+                    except Exception as e:
+                        print(f"⚠️ Text extraction error on {filename}: {e}")
+
+                    doc.seek(0)
+                    doc_url = upload_to_supabase(doc, folder="tenders")
                     if doc_url:
-                        uploaded_paths.append(doc_url)
-        docs_json = json.dumps(uploaded_paths) if uploaded_paths else "[]"
+                        uploaded_docs.append({
+                            "title": filename,
+                            "fileUrl": doc_url,
+                            "extractedText": extracted_text
+                        })
+
+        docs_json = json.dumps(uploaded_docs) if uploaded_docs else "[]"
         
         new_tender = Tender(
             project_title=data.get('projectTitle'), nit_number=data.get('nitNumber'),
@@ -1034,22 +1052,74 @@ def update_tender():
         tender.location = data.get('location', tender.location)
         tender.project_description = data.get('description', tender.project_description)
         tender.deadline = data.get('deadline', tender.deadline)
+        
         retained_docs_str = data.get('retained_docs')
         existing_docs = []
         if retained_docs_str:
             try: 
-                existing_docs = json.loads(retained_docs_str)
+                parsed_retained = json.loads(retained_docs_str)
+                for item in parsed_retained:
+                    if isinstance(item, str):
+                        existing_docs.append({"title": item.split('/')[-1], "fileUrl": item, "extractedText": ""})
+                    elif isinstance(item, dict):
+                        existing_docs.append(item)
             except Exception: 
                 pass
+
         for file_key in request.files:
             for doc in request.files.getlist(file_key):
                 if doc.filename != '':
-                    doc_url = upload_to_firebase(doc, folder="tenders")
+                    filename = doc.filename
+                    extracted_text = ""
+                    try:
+                        file_bytes = doc.read()
+                        doc.seek(0)
+                        file_like = io.BytesIO(file_bytes)
+                        reader = PyPDF2.PdfReader(file_like)
+                        for page_num, page in enumerate(reader.pages):
+                            page_text = page.extract_text()
+                            if page_text:
+                                extracted_text += f"\n--- Page {page_num + 1} ---\n" + page_text
+                    except Exception as e:
+                        print(f"⚠️ Text extraction error on update: {e}")
+
+                    doc.seek(0)
+                    doc_url = upload_to_supabase(doc, folder="tenders")
                     if doc_url:
-                        existing_docs.append(doc_url)
+                        existing_docs.append({
+                            "title": filename,
+                            "fileUrl": doc_url,
+                            "extractedText": extracted_text
+                        })
+
         tender.tender_docs = json.dumps(existing_docs)
         db.session.commit()
         return jsonify({"success": True, "message": "Tender updated successfully."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/api/admin/delete_tender/<int:tender_id>', methods=['DELETE', 'POST'], strict_slashes=False)
+@app.route('/api/admin/delete_tender/', methods=['DELETE', 'POST'], strict_slashes=False)
+def delete_tender_admin(tender_id=None):
+    try:
+        if tender_id is None:
+            tender_id = request.args.get('tender_id') or (request.get_json(silent=True) or {}).get('tender_id') or request.form.get('tender_id')
+            
+        if not tender_id:
+            return jsonify({"success": False, "message": "Tender ID missing"}), 400
+            
+        tender = db.session.get(Tender, int(tender_id))
+        if not tender:
+            return jsonify({"success": False, "message": "Tender not found"}), 404
+            
+        # Delete associated bids first to prevent foreign key constraint violations
+        Bid.query.filter_by(tender_id=tender.id).delete()
+        
+        db.session.delete(tender)
+        db.session.commit()
+        
+        return jsonify({"success": True, "message": "Tender deleted successfully!"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "message": str(e)}), 500
@@ -1075,12 +1145,19 @@ def get_single_tender(tender_id=None):
         tender = db.session.get(Tender, int(str(tender_id).strip()))
         if not tender: 
             return jsonify({"success": False, "message": "Tender not found"}), 404
+            
         docs_list = []
         if tender.tender_docs:
             try: 
-                docs_list = json.loads(tender.tender_docs)
+                parsed = json.loads(tender.tender_docs)
+                for item in parsed:
+                    if isinstance(item, str):
+                        docs_list.append({"title": item.split('/')[-1], "fileUrl": item, "extractedText": ""})
+                    elif isinstance(item, dict):
+                        docs_list.append(item)
             except Exception: 
                 pass
+
         return jsonify({
             "success": True,
             "tender": {
