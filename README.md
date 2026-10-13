@@ -48,3 +48,37 @@ The backend service powering the **TenderAnalyser** ecosystem. Built with Python
    ```bash
    git clone [https://github.com/aravinth016/TenderAnalyser-Backend.git](https://github.com/aravinth016/TenderAnalyser-Backend.git)
    cd TenderAnalyser-Backend
+2. Create and activate virtual environment:
+
+   Bash
+   python3 -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+ 
+3. Install dependencies:
+
+   Bash
+   pip install -r requirements.txt
+  
+4.Environment Configuration:
+
+   Create a local .env file in the root directory:
+   Code snippet:
+     FLASK_ENV=development
+     SECRET_KEY=your_secret_key_here
+    
+5. Run the server:
+
+    Bash
+    
+     python app.py
+     The API server will start at http://127.0.0.1:5000/.
+
+6.🐳 Running with Docker
+    To build and run the backend locally using Docker:
+
+   Bash
+    # Build Docker image
+    docker build -t tender-analyser-backend .
+    
+    # Run Docker container
+    docker run -p 5000:5000 tender-analyser-backend
