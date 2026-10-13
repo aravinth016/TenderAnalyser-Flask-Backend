@@ -2,7 +2,7 @@
 
 The backend service powering the **TenderAnalyser** ecosystem. Built with Python and Flask, containerized via Docker, and deployed on Render. It handles business logic, bid evaluation state machines, document metadata, and competitive financial analytics.
 
-> 🔗 **Frontend Repository:** Looking for the Android app? Check out the [TenderAnalyser Android App](https://github.com/aravinth016/TenderAnalyser-Frontend-Kotlin).
+> 🔗 **Frontend Repository:** Looking for the Android app? Check out the [TenderAnalyser Frontend Kotlin](https://github.com/aravinth016/TenderAnalyser-Frontend-Kotlin).
 
 ---
 
